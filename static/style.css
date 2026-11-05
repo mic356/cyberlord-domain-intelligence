@@ -14,3 +14,15 @@
 .bybit-qr-card img{width:220px;max-width:100%;background:#fff;padding:8px;border-radius:10px;margin:16px auto}
 .bybit-qr-card p{color:#a9b8ce;font-size:12px;line-height:1.6}
 .bybit-qr-card a{display:inline-block;margin:8px}
+
+/* Refined integrated account panel */
+.auth-panel{max-width:760px;position:relative;overflow:hidden;background:radial-gradient(ellipse at 100% 0,#1b526044,transparent 45%),linear-gradient(145deg,#121d30,#0e1726);border-color:#31506a;box-shadow:0 18px 55px #0005}
+.auth-panel:before{content:"";position:absolute;inset:0 auto 0 0;width:3px;background:linear-gradient(#38e5db,#5b8cff,#a67bff)}
+.auth-panel h3{font-size:21px}.auth-panel .field{background:#091321;border-color:#30435d;transition:border-color .2s,box-shadow .2s}
+.auth-panel .field:focus{border-color:#38e5db;box-shadow:0 0 0 3px #38e5db18}
+.auth-links{display:flex;justify-content:flex-end;margin-top:10px}
+.text-link{border:0;background:transparent;color:#62dcd9;font-size:11px;cursor:pointer;padding:6px}
+.text-link:hover{text-decoration:underline}
+.reset-request{margin-top:14px;padding:16px;border:1px solid #2c4960;border-radius:11px;background:#0a1422;display:grid;gap:10px}
+.reset-request[hidden]{display:none}
+.reset-request label{font-size:10px;color:#a9bad0}

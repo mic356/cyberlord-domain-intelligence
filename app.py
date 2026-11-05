@@ -3,6 +3,9 @@ from datetime import datetime, timezone, timedelta
 from functools import wraps
 from urllib.parse import urlparse
 import requests
+import smtplib
+from email.message import EmailMessage
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 import dns.resolver
 from flask import Flask, request, jsonify, render_template, session, redirect, url_for
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -41,6 +44,32 @@ def init_db():
 
 init_db()
 
+
+
+def send_password_reset_email(email, token):
+    host = os.getenv('SMTP_HOST', '')
+    user = os.getenv('SMTP_USERNAME', '')
+    password = os.getenv('SMTP_PASSWORD', '')
+    sender = os.getenv('SMTP_FROM', user)
+    if not all([host, user, password, sender]):
+        app.logger.warning('Password reset requested but SMTP is not configured.')
+        return False
+    port = int(os.getenv('SMTP_PORT', '587'))
+    link = request.url_root.rstrip('/') + url_for('reset_password_page', token=token)
+    msg = EmailMessage()
+    msg['Subject'] = 'Reset your CyberLord password'
+    msg['From'] = sender
+    msg['To'] = email
+    msg.set_content('Use this one-time link to reset your CyberLord password (expires in 30 minutes):\\n\\n' + link + '\\n\\nIf you did not request this, ignore this email.')
+    try:
+        with smtplib.SMTP(host, port, timeout=12) as server:
+            server.starttls()
+            server.login(user, password)
+            server.send_message(msg)
+        return True
+    except Exception:
+        app.logger.exception('Password reset email delivery failed.')
+        return False
 
 def current_email():
     return session.get('email')
@@ -99,7 +128,7 @@ def resolve_public(domain):
 
 def dns_records(domain):
     result = {}
-    for kind in ['A','AAAA','MX','NS','TXT','CAA','SOA']:
+    for kind in ['A','AAAA','MX','NS','TXT','CAA','SOA','DNSKEY']:
         try:
             ans = dns.resolver.resolve(domain, kind, lifetime=4)
             result[kind] = [str(x).strip('"') for x in ans][:30]
@@ -204,6 +233,45 @@ def login():
     session['email']=email
     return jsonify({'ok':True,'email':email,'premium':premium(email)})
 
+
+@app.post('/api/password-reset/request')
+def request_password_reset():
+    data = request.get_json(silent=True) or {}
+    email = (data.get('email') or '').strip().lower()
+    # Always return the same response to avoid revealing registered accounts.
+    if re.fullmatch(r'[^@\\s]+@[^@\\s]+\\.[^@\\s]+', email):
+        with db() as c:
+            user = c.execute('SELECT 1 FROM users WHERE email=?', (email,)).fetchone()
+        if user:
+            serializer = URLSafeTimedSerializer(app.secret_key, salt='cyberlord-password-reset')
+            token = serializer.dumps(email)
+            send_password_reset_email(email, token)
+    return jsonify({'ok': True, 'message': 'If that email is registered and email delivery is configured, a reset link will arrive shortly.'})
+
+@app.get('/reset-password/<token>')
+def reset_password_page(token):
+    return render_template('reset_password.html', token=token)
+
+@app.post('/api/password-reset/confirm')
+def confirm_password_reset():
+    data = request.get_json(silent=True) or {}
+    token = data.get('token', '')
+    password = data.get('password', '')
+    if len(password) < 10:
+        return jsonify({'error': 'Choose a password with at least 10 characters.'}), 400
+    serializer = URLSafeTimedSerializer(app.secret_key, salt='cyberlord-password-reset')
+    try:
+        email = serializer.loads(token, max_age=1800)
+    except SignatureExpired:
+        return jsonify({'error': 'This reset link has expired. Request a new one.'}), 400
+    except BadSignature:
+        return jsonify({'error': 'This reset link is invalid. Request a new one.'}), 400
+    with db() as c:
+        cur = c.execute('UPDATE users SET password_hash=? WHERE email=?', (generate_password_hash(password), email))
+        if cur.rowcount != 1:
+            return jsonify({'error': 'Account not found.'}), 404
+    return jsonify({'ok': True, 'message': 'Password updated. You can now sign in.'})
+
 @app.post('/api/logout')
 def logout():
     session.clear(); return jsonify({'ok':True})
@@ -242,7 +310,14 @@ def email_security():
     for label, name in [('SPF',domain),('DMARC','_dmarc.'+domain),('DKIM selector default','default._domainkey.'+domain)]:
         try: result[label]=[str(x).strip('"') for x in dns.resolver.resolve(name,'TXT',lifetime=4)]
         except Exception: result[label]=[]
-    return jsonify({'domain':domain,'records':result,'note':'DKIM commonly uses provider-specific selectors; an empty default selector does not prove DKIM is absent.'})
+    spf = [x for x in result['SPF'] if x.lower().startswith('v=spf1')]
+    dmarc = [x for x in result['DMARC'] if x.lower().startswith('v=dmarc1')]
+    findings = []
+    if not spf: findings.append({'severity':'high','finding':'No SPF policy detected','recommendation':'Publish an SPF TXT record listing authorised sending services.'})
+    elif sum(1 for x in spf[0].split() if x == 'include:') > 10: findings.append({'severity':'medium','finding':'Review SPF DNS lookup limits','recommendation':'SPF evaluation is limited to 10 DNS-triggering mechanisms.'})
+    if not dmarc: findings.append({'severity':'high','finding':'No DMARC policy detected','recommendation':'Publish _dmarc with a monitored policy; progress toward quarantine/reject after validation.'})
+    elif 'p=none' in dmarc[0].replace(' ','').lower(): findings.append({'severity':'medium','finding':'DMARC is monitoring-only','recommendation':'Review aggregate reports and consider moving to quarantine/reject when safe.'})
+    return jsonify({'domain':domain,'records':result,'findings':findings,'note':'DKIM selector discovery is provider-specific; an empty default selector does not prove DKIM is absent. SPF/DKIM/DMARC checks are DNS observations, not proof of mail deliverability.'})
 
 @app.post('/api/ip-intel')
 @login_required
@@ -334,7 +409,7 @@ def limited_port_scan():
     for port in ports:
         try:
             with socket.create_connection((ip, port), timeout=0.45):
-                found.append({'port': port, 'state': 'open'})
+                found.append({'port': port, 'state': 'open', 'service': {22:'SSH',25:'SMTP',53:'DNS',80:'HTTP',110:'POP3',143:'IMAP',443:'HTTPS',445:'SMB',587:'SMTP submission',993:'IMAPS',995:'POP3S',3306:'MySQL',3389:'RDP',5432:'PostgreSQL',8080:'HTTP alternate',8443:'HTTPS alternate'}.get(port, 'unknown')})
         except (OSError, TimeoutError):
             pass
     return jsonify({'domain': domain, 'ip_checked': ip, 'ports_checked': len(ports), 'open_ports': found,

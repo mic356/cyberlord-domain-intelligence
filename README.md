@@ -81,3 +81,19 @@ Do not paste API secrets or private keys into source code, GitHub, or ChatGPT. N
 ### Important deployment note
 
 This ZIP is the updated source code, not an already-deployed update. Upload the changed files to the existing GitHub repository and let Render deploy them. Keep your current Render environment variables and persistent disk. Do not delete the existing service or database.
+
+
+## Enhanced release notes
+
+This update adds a password-reset flow and improves the account panel styling. Password reset delivery requires SMTP environment variables on the hosting service:
+
+- `FLASK_SECRET_KEY`: a long, random, stable secret (keep private; do not change between deploys)
+- `SMTP_HOST`: your email provider's SMTP host
+- `SMTP_PORT`: usually `587` for STARTTLS
+- `SMTP_USERNAME`: SMTP login username
+- `SMTP_PASSWORD`: SMTP app password / SMTP credential (never publish it)
+- `SMTP_FROM`: verified sender email address
+
+Without SMTP configuration, the reset endpoint deliberately returns a generic response and no email is sent. Configure and test SMTP before advertising password recovery as available. Reset links expire after 30 minutes.
+
+The scan updates add DNSKEY record visibility, basic SPF/DMARC policy observations, and service labels for the existing fixed common-port TCP checks. These remain bounded, non-exploitative checks; they are not a full vulnerability assessment or exhaustive port scan. Only assess systems you own or are authorised to test.
