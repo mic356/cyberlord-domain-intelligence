@@ -3,3 +3,4 @@ gunicorn==23.0.0
 requests==2.32.5
 dnspython==2.8.0
 cryptography>=42.0.0
+phonenumbers==9.0.10

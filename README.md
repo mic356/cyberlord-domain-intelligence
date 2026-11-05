@@ -83,17 +83,12 @@ Do not paste API secrets or private keys into source code, GitHub, or ChatGPT. N
 This ZIP is the updated source code, not an already-deployed update. Upload the changed files to the existing GitHub repository and let Render deploy them. Keep your current Render environment variables and persistent disk. Do not delete the existing service or database.
 
 
-## Enhanced release notes
+## Subscription plans (monthly)
 
-This update adds a password-reset flow and improves the account panel styling. Password reset delivery requires SMTP environment variables on the hosting service:
+- Free: ₦0, no expiry.
+- Premium: ₦5,000 / 30 days (configurable with `PREMIUM_PRICE_NGN`).
+- Professional: ₦10,000 / 30 days (configurable with `PROFESSIONAL_PRICE_NGN`).
 
-- `FLASK_SECRET_KEY`: a long, random, stable secret (keep private; do not change between deploys)
-- `SMTP_HOST`: your email provider's SMTP host
-- `SMTP_PORT`: usually `587` for STARTTLS
-- `SMTP_USERNAME`: SMTP login username
-- `SMTP_PASSWORD`: SMTP app password / SMTP credential (never publish it)
-- `SMTP_FROM`: verified sender email address
+Paystack amounts are set and checked on the server in kobo. A successful transaction is tied to the signed-in account and grants a 30-day entitlement. Repeated verification/webhook delivery does not extend an already processed transaction. Existing entitlement rows are migrated to a 30-day expiry based on their original `updated_at`.
 
-Without SMTP configuration, the reset endpoint deliberately returns a generic response and no email is sent. Configure and test SMTP before advertising password recovery as available. Reset links expire after 30 minutes.
-
-The scan updates add DNSKEY record visibility, basic SPF/DMARC policy observations, and service labels for the existing fixed common-port TCP checks. These remain bounded, non-exploitative checks; they are not a full vulnerability assessment or exhaustive port scan. Only assess systems you own or are authorised to test.
+Phone intelligence validates international numbering-plan data and displays available public metadata; it does not prove number ownership. Actual SMS OTP ownership checks require a configured SMS gateway and are not enabled by this release. Individual email intelligence accepts any syntactically valid domain and checks public DNS mail configuration; it does not verify mailbox existence.

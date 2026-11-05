@@ -3,16 +3,14 @@ from datetime import datetime, timezone, timedelta
 from functools import wraps
 from urllib.parse import urlparse
 import requests
-import smtplib
-from email.message import EmailMessage
-from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 import dns.resolver
 from flask import Flask, request, jsonify, render_template, session, redirect, url_for
 from werkzeug.security import generate_password_hash, check_password_hash
 
 APP_NAME = 'CyberLord Domain Intelligence'
 DB_PATH = os.getenv('PAYMENTS_DB', 'cyberlord.db')
-PRICE_KOBO = 500000
+PRICE_KOBO = 500000  # legacy Premium price; plan-specific prices are resolved server-side
+PLAN_PRICES_KOBO = {'premium': int(os.getenv('PREMIUM_PRICE_NGN', '5000')) * 100, 'professional': int(os.getenv('PROFESSIONAL_PRICE_NGN', '10000')) * 100}
 PAYSTACK_SECRET_KEY = os.getenv('PAYSTACK_SECRET_KEY', '')
 PAYSTACK_WEBHOOK_SECRET = os.getenv('PAYSTACK_WEBHOOK_SECRET', '')
 TON_WALLET_ADDRESS = os.getenv('TON_WALLET_ADDRESS', '')
@@ -37,50 +35,51 @@ def db():
 def init_db():
     with db() as c:
         c.execute('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, created_at TEXT NOT NULL)')
-        c.execute('CREATE TABLE IF NOT EXISTS payments (reference TEXT PRIMARY KEY, email TEXT NOT NULL, amount INTEGER NOT NULL, currency TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL)')
-        c.execute('CREATE TABLE IF NOT EXISTS entitlements (email TEXT PRIMARY KEY, plan TEXT NOT NULL, updated_at TEXT NOT NULL)')
+        c.execute("CREATE TABLE IF NOT EXISTS payments (reference TEXT PRIMARY KEY, email TEXT NOT NULL, amount INTEGER NOT NULL, currency TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, plan TEXT NOT NULL DEFAULT 'premium')")
+        c.execute('CREATE TABLE IF NOT EXISTS entitlements (email TEXT PRIMARY KEY, plan TEXT NOT NULL, updated_at TEXT NOT NULL, expires_at TEXT)')
+        # Safe additive migrations for existing installations.
+        payment_cols = {r['name'] for r in c.execute('PRAGMA table_info(payments)').fetchall()}
+        if 'plan' not in payment_cols: c.execute("ALTER TABLE payments ADD COLUMN plan TEXT NOT NULL DEFAULT 'premium'")
+        entitlement_cols = {r['name'] for r in c.execute('PRAGMA table_info(entitlements)').fetchall()}
+        if 'expires_at' not in entitlement_cols: c.execute('ALTER TABLE entitlements ADD COLUMN expires_at TEXT')
+        # Convert legacy non-expiring paid rows to a 30-day entitlement from their original grant date.
+        for old in c.execute('SELECT email, updated_at FROM entitlements WHERE expires_at IS NULL').fetchall():
+            try: exp = (datetime.fromisoformat(old['updated_at']) + timedelta(days=30)).isoformat()
+            except Exception: exp = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+            c.execute('UPDATE entitlements SET expires_at=? WHERE email=?', (exp, old['email']))
         c.execute('CREATE TABLE IF NOT EXISTS scan_history (id INTEGER PRIMARY KEY, email TEXT NOT NULL, target TEXT NOT NULL, score INTEGER, created_at TEXT NOT NULL, report_json TEXT NOT NULL)')
         c.execute('CREATE TABLE IF NOT EXISTS bybit_payments (merchant_trade_no TEXT PRIMARY KEY, email TEXT NOT NULL, amount TEXT NOT NULL, currency TEXT NOT NULL, status TEXT NOT NULL, pay_id TEXT, created_at TEXT NOT NULL)')
 
 init_db()
 
 
-
-def send_password_reset_email(email, token):
-    host = os.getenv('SMTP_HOST', '')
-    user = os.getenv('SMTP_USERNAME', '')
-    password = os.getenv('SMTP_PASSWORD', '')
-    sender = os.getenv('SMTP_FROM', user)
-    if not all([host, user, password, sender]):
-        app.logger.warning('Password reset requested but SMTP is not configured.')
-        return False
-    port = int(os.getenv('SMTP_PORT', '587'))
-    link = request.url_root.rstrip('/') + url_for('reset_password_page', token=token)
-    msg = EmailMessage()
-    msg['Subject'] = 'Reset your CyberLord password'
-    msg['From'] = sender
-    msg['To'] = email
-    msg.set_content('Use this one-time link to reset your CyberLord password (expires in 30 minutes):\\n\\n' + link + '\\n\\nIf you did not request this, ignore this email.')
-    try:
-        with smtplib.SMTP(host, port, timeout=12) as server:
-            server.starttls()
-            server.login(user, password)
-            server.send_message(msg)
-        return True
-    except Exception:
-        app.logger.exception('Password reset email delivery failed.')
-        return False
-
 def current_email():
     return session.get('email')
 
 
-def premium(email=None):
+def entitlement(email=None):
     email = email or current_email()
     if not email:
-        return False
+        return {'plan': 'free', 'active': False, 'expires_at': None}
     with db() as c:
-        return c.execute('SELECT 1 FROM entitlements WHERE email=? AND plan="premium"', (email,)).fetchone() is not None
+        row = c.execute('SELECT plan, expires_at FROM entitlements WHERE email=?', (email,)).fetchone()
+    if not row:
+        return {'plan': 'free', 'active': False, 'expires_at': None}
+    expires = row['expires_at']
+    active = True
+    if expires:
+        try: active = datetime.fromisoformat(expires) > datetime.now(timezone.utc)
+        except ValueError: active = False
+    plan = row['plan'] if active else 'free'
+    return {'plan': plan, 'active': plan in ('premium', 'professional'), 'expires_at': expires if active else None}
+
+
+def premium(email=None):
+    return entitlement(email)['active']
+
+
+def professional(email=None):
+    return entitlement(email)['plan'] == 'professional'
 
 
 def login_required(fn):
@@ -97,6 +96,15 @@ def premium_required(fn):
     def wrapped(*a, **kw):
         if not premium():
             return jsonify({'error': 'Premium feature. Upgrade to unlock this tool.'}), 402
+        return fn(*a, **kw)
+    return wrapped
+
+
+def professional_required(fn):
+    @wraps(fn)
+    def wrapped(*a, **kw):
+        if not professional():
+            return jsonify({'error': 'Professional feature. Upgrade to the Professional plan to unlock this tool.'}), 402
         return fn(*a, **kw)
     return wrapped
 
@@ -128,7 +136,7 @@ def resolve_public(domain):
 
 def dns_records(domain):
     result = {}
-    for kind in ['A','AAAA','MX','NS','TXT','CAA','SOA','DNSKEY']:
+    for kind in ['A','AAAA','MX','NS','TXT','CAA','SOA']:
         try:
             ans = dns.resolver.resolve(domain, kind, lifetime=4)
             result[kind] = [str(x).strip('"') for x in ans][:30]
@@ -233,51 +241,12 @@ def login():
     session['email']=email
     return jsonify({'ok':True,'email':email,'premium':premium(email)})
 
-
-@app.post('/api/password-reset/request')
-def request_password_reset():
-    data = request.get_json(silent=True) or {}
-    email = (data.get('email') or '').strip().lower()
-    # Always return the same response to avoid revealing registered accounts.
-    if re.fullmatch(r'[^@\\s]+@[^@\\s]+\\.[^@\\s]+', email):
-        with db() as c:
-            user = c.execute('SELECT 1 FROM users WHERE email=?', (email,)).fetchone()
-        if user:
-            serializer = URLSafeTimedSerializer(app.secret_key, salt='cyberlord-password-reset')
-            token = serializer.dumps(email)
-            send_password_reset_email(email, token)
-    return jsonify({'ok': True, 'message': 'If that email is registered and email delivery is configured, a reset link will arrive shortly.'})
-
-@app.get('/reset-password/<token>')
-def reset_password_page(token):
-    return render_template('reset_password.html', token=token)
-
-@app.post('/api/password-reset/confirm')
-def confirm_password_reset():
-    data = request.get_json(silent=True) or {}
-    token = data.get('token', '')
-    password = data.get('password', '')
-    if len(password) < 10:
-        return jsonify({'error': 'Choose a password with at least 10 characters.'}), 400
-    serializer = URLSafeTimedSerializer(app.secret_key, salt='cyberlord-password-reset')
-    try:
-        email = serializer.loads(token, max_age=1800)
-    except SignatureExpired:
-        return jsonify({'error': 'This reset link has expired. Request a new one.'}), 400
-    except BadSignature:
-        return jsonify({'error': 'This reset link is invalid. Request a new one.'}), 400
-    with db() as c:
-        cur = c.execute('UPDATE users SET password_hash=? WHERE email=?', (generate_password_hash(password), email))
-        if cur.rowcount != 1:
-            return jsonify({'error': 'Account not found.'}), 404
-    return jsonify({'ok': True, 'message': 'Password updated. You can now sign in.'})
-
 @app.post('/api/logout')
 def logout():
     session.clear(); return jsonify({'ok':True})
 
 @app.get('/api/me')
-def me(): return jsonify({'email':current_email(),'premium':premium(),'ton_wallet':TON_WALLET_ADDRESS})
+def me(): e=entitlement(); return jsonify({'email':current_email(),'premium':e['active'],'plan':e['plan'],'expires_at':e['expires_at'],'professional':e['plan']=='professional','ton_wallet':TON_WALLET_ADDRESS})
 
 @app.post('/api/scan')
 @login_required
@@ -310,14 +279,7 @@ def email_security():
     for label, name in [('SPF',domain),('DMARC','_dmarc.'+domain),('DKIM selector default','default._domainkey.'+domain)]:
         try: result[label]=[str(x).strip('"') for x in dns.resolver.resolve(name,'TXT',lifetime=4)]
         except Exception: result[label]=[]
-    spf = [x for x in result['SPF'] if x.lower().startswith('v=spf1')]
-    dmarc = [x for x in result['DMARC'] if x.lower().startswith('v=dmarc1')]
-    findings = []
-    if not spf: findings.append({'severity':'high','finding':'No SPF policy detected','recommendation':'Publish an SPF TXT record listing authorised sending services.'})
-    elif sum(1 for x in spf[0].split() if x == 'include:') > 10: findings.append({'severity':'medium','finding':'Review SPF DNS lookup limits','recommendation':'SPF evaluation is limited to 10 DNS-triggering mechanisms.'})
-    if not dmarc: findings.append({'severity':'high','finding':'No DMARC policy detected','recommendation':'Publish _dmarc with a monitored policy; progress toward quarantine/reject after validation.'})
-    elif 'p=none' in dmarc[0].replace(' ','').lower(): findings.append({'severity':'medium','finding':'DMARC is monitoring-only','recommendation':'Review aggregate reports and consider moving to quarantine/reject when safe.'})
-    return jsonify({'domain':domain,'records':result,'findings':findings,'note':'DKIM selector discovery is provider-specific; an empty default selector does not prove DKIM is absent. SPF/DKIM/DMARC checks are DNS observations, not proof of mail deliverability.'})
+    return jsonify({'domain':domain,'records':result,'note':'DKIM commonly uses provider-specific selectors; an empty default selector does not prove DKIM is absent.'})
 
 @app.post('/api/ip-intel')
 @login_required
@@ -409,7 +371,7 @@ def limited_port_scan():
     for port in ports:
         try:
             with socket.create_connection((ip, port), timeout=0.45):
-                found.append({'port': port, 'state': 'open', 'service': {22:'SSH',25:'SMTP',53:'DNS',80:'HTTP',110:'POP3',143:'IMAP',443:'HTTPS',445:'SMB',587:'SMTP submission',993:'IMAPS',995:'POP3S',3306:'MySQL',3389:'RDP',5432:'PostgreSQL',8080:'HTTP alternate',8443:'HTTPS alternate'}.get(port, 'unknown')})
+                found.append({'port': port, 'state': 'open'})
         except (OSError, TimeoutError):
             pass
     return jsonify({'domain': domain, 'ip_checked': ip, 'ports_checked': len(ports), 'open_ports': found,
@@ -426,6 +388,73 @@ def compare():
     if a==b: return jsonify({'error':'Enter two different domains.'}),400
     ra=run_scan(a); rb=run_scan(b)
     return jsonify({'domain_a':{'domain':a,'score':ra['score'],'ips':ra['ips'],'tls':ra['tls'],'findings':ra['findings']},'domain_b':{'domain':b,'score':rb['score'],'ips':rb['ips'],'tls':rb['tls'],'findings':rb['findings']}})
+
+@app.post('/api/email-intel')
+@login_required
+@premium_required
+def individual_email_intel():
+    raw = (request.get_json(silent=True) or {}).get('email', '').strip().lower()
+    if len(raw) > 254 or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", raw):
+        return jsonify({'error': 'Enter one valid individual email address.'}), 400
+    local, domain = raw.rsplit('@', 1)
+    try: domain = normalize_domain(domain)
+    except ValueError as e: return jsonify({'error': 'The email domain is not valid: ' + str(e)}), 400
+    records = {}
+    for kind in ['MX', 'TXT']:
+        try: records[kind] = [str(x).strip('"') for x in dns.resolver.resolve(domain, kind, lifetime=4)][:30]
+        except Exception: records[kind] = []
+    try:
+        dmarc = [str(x).strip('"') for x in dns.resolver.resolve('_dmarc.' + domain, 'TXT', lifetime=4)]
+    except Exception: dmarc = []
+    txt = records.get('TXT', [])
+    return jsonify({'email': raw, 'local_part_present': bool(local), 'domain': domain,
+                    'mx_records': records['MX'], 'spf_records': [x for x in txt if x.lower().startswith('v=spf1')],
+                    'dmarc_records': dmarc, 'has_mx': bool(records['MX']),
+                    'note': 'This checks public mail-domain configuration only. It does not confirm mailbox existence, ownership, inbox access, or breach status.'})
+
+
+@app.post('/api/phone-intel')
+@login_required
+@premium_required
+def phone_intel():
+    raw = (request.get_json(silent=True) or {}).get('phone', '').strip()
+    if not raw or len(raw) > 40:
+        return jsonify({'error': 'Enter a phone number including its country code, e.g. +2348012345678.'}), 400
+    try:
+        import phonenumbers
+        from phonenumbers import carrier, geocoder, number_type
+        number = phonenumbers.parse(raw, None)
+        if not phonenumbers.is_possible_number(number) or not phonenumbers.is_valid_number(number):
+            return jsonify({'error': 'The number does not appear to be a valid number in its numbering region.'}), 400
+        kinds = {0:'FIXED_LINE',1:'MOBILE',2:'FIXED_LINE_OR_MOBILE',3:'TOLL_FREE',4:'PREMIUM_RATE',5:'SHARED_COST',6:'VOIP',7:'PERSONAL_NUMBER',8:'PAGER',9:'UAN',10:'VOICEMAIL',99:'UNKNOWN'}
+        return jsonify({'input': raw, 'international_format': phonenumbers.format_number(number, phonenumbers.PhoneNumberFormat.INTERNATIONAL),
+                        'e164': phonenumbers.format_number(number, phonenumbers.PhoneNumberFormat.E164),
+                        'valid_numbering_plan': True, 'country_code': number.country_code,
+                        'region': phonenumbers.region_code_for_number(number),
+                        'location': geocoder.description_for_number(number, 'en'),
+                        'number_type': kinds.get(number_type(number), 'UNKNOWN'),
+                        'carrier': carrier.name_for_number(number, 'en') or 'Not available',
+                        'ownership_verified': False,
+                        'note': 'Numbering-plan and public metadata only. This does not prove that the user owns or controls the number. SMS OTP ownership verification requires a configured SMS provider.'})
+    except ImportError:
+        return jsonify({'error': 'Phone intelligence dependency is not installed. Deploy the updated requirements.txt.'}), 503
+    except Exception:
+        return jsonify({'error': 'Use international format with a +country code, for example +2348012345678.'}), 400
+
+
+@app.post('/api/attack-surface-map')
+@login_required
+@professional_required
+def attack_surface_map():
+    try: domain = normalize_domain((request.get_json(silent=True) or {}).get('domain'))
+    except ValueError as e: return jsonify({'error': str(e)}), 400
+    ips = resolve_public(domain)
+    subs = ct_subdomains(domain, 250)
+    records = dns_records(domain)
+    return jsonify({'domain': domain, 'public_ips': ips, 'subdomains': subs, 'dns': records,
+                    'tls': tls_info(domain), 'mapping_scope': 'Passive public DNS and certificate-transparency data only',
+                    'note': 'This map does not exploit hosts or probe third-party infrastructure. Assess only assets you own or are authorised to test.'})
+
 
 @app.get('/api/history')
 @login_required
@@ -446,11 +475,14 @@ def report(report_id):
 def payment_initialize():
     if not PAYSTACK_SECRET_KEY: return jsonify({'error':'Payments are not configured yet. Add PAYSTACK_SECRET_KEY in your hosting environment.'}),503
     email=current_email(); reference='CLDI_'+secrets.token_hex(12)
+    plan = (request.get_json(silent=True) or {}).get('plan', 'premium')
+    if plan not in PLAN_PRICES_KOBO: return jsonify({'error':'Choose a valid paid plan.'}),400
+    amount_kobo = PLAN_PRICES_KOBO[plan]
     try:
-        r=requests.post('https://api.paystack.co/transaction/initialize',headers={'Authorization':'Bearer '+PAYSTACK_SECRET_KEY,'Content-Type':'application/json'},json={'email':email,'amount':PRICE_KOBO,'currency':'NGN','reference':reference,'callback_url':request.url_root.rstrip('/')+'/payment/return','channels':['card','bank','bank_transfer','ussd'],'metadata':{'product':APP_NAME,'plan':'premium'}},timeout=15)
+        r=requests.post('https://api.paystack.co/transaction/initialize',headers={'Authorization':'Bearer '+PAYSTACK_SECRET_KEY,'Content-Type':'application/json'},json={'email':email,'amount':amount_kobo,'currency':'NGN','reference':reference,'callback_url':request.url_root.rstrip('/')+'/payment/return','channels':['card','bank','bank_transfer','ussd'],'metadata':{'product':APP_NAME,'plan':plan}},timeout=15)
         data=r.json()
         if not data.get('status'): return jsonify({'error':data.get('message','Could not initialize payment.')}),502
-        with db() as c: c.execute('INSERT INTO payments(reference,email,amount,currency,status,created_at) VALUES(?,?,?,?,?,?)',(reference,email,PRICE_KOBO,'NGN','pending',datetime.now(timezone.utc).isoformat()))
+        with db() as c: c.execute('INSERT INTO payments(reference,email,amount,currency,status,created_at,plan) VALUES(?,?,?,?,?,?,?)',(reference,email,amount_kobo,'NGN','pending',datetime.now(timezone.utc).isoformat(),plan))
         return jsonify({'authorization_url':data['data']['authorization_url'],'reference':reference})
     except Exception: return jsonify({'error':'Paystack could not be reached. Try again.'}),502
 
@@ -461,11 +493,13 @@ def verify_reference(reference):
     data=r.json().get('data',{})
     with db() as c: payment=c.execute('SELECT * FROM payments WHERE reference=?',(reference,)).fetchone()
     if not payment: return False
-    valid=(data.get('status')=='success' and data.get('amount')==PRICE_KOBO and data.get('currency')=='NGN' and data.get('reference')==reference and (data.get('customer',{}).get('email','').lower()==payment['email'].lower()))
+    if payment['status'] == 'success': return True
+    valid=(data.get('status')=='success' and data.get('amount')==payment['amount'] and data.get('amount')==PLAN_PRICES_KOBO.get(payment['plan']) and data.get('currency')=='NGN' and data.get('reference')==reference and (data.get('customer',{}).get('email','').lower()==payment['email'].lower()))
     if valid:
         with db() as c:
             c.execute('UPDATE payments SET status="success" WHERE reference=?',(reference,))
-            c.execute('INSERT INTO entitlements(email,plan,updated_at) VALUES(?,?,?) ON CONFLICT(email) DO UPDATE SET plan=excluded.plan,updated_at=excluded.updated_at',(payment['email'],'premium',datetime.now(timezone.utc).isoformat()))
+            expires=(datetime.now(timezone.utc)+timedelta(days=30)).isoformat()
+            c.execute('INSERT INTO entitlements(email,plan,updated_at,expires_at) VALUES(?,?,?,?) ON CONFLICT(email) DO UPDATE SET plan=excluded.plan,updated_at=excluded.updated_at,expires_at=excluded.expires_at',(payment['email'],payment['plan'],datetime.now(timezone.utc).isoformat(),expires))
     return valid
 
 
@@ -578,12 +612,13 @@ def bybit_webhook():
     if event.get('status') == 'PAY_SUCCESS' and event.get('paymentType') == 'E_COMMERCE':
         with db() as c:
             payment = c.execute('SELECT * FROM bybit_payments WHERE merchant_trade_no=?', (trade_no,)).fetchone()
-        if payment and event.get('currency') == 'USDT' and str(event.get('amount')) == payment['amount']:
+        if payment and payment['status'] != 'success' and event.get('currency') == 'USDT' and str(event.get('amount')) == payment['amount']:
             with db() as c:
                 c.execute('UPDATE bybit_payments SET status="success", pay_id=COALESCE(?,pay_id) WHERE merchant_trade_no=?',
                           (event.get('payId'), trade_no))
-                c.execute('INSERT INTO entitlements(email,plan,updated_at) VALUES(?,?,?) ON CONFLICT(email) DO UPDATE SET plan=excluded.plan,updated_at=excluded.updated_at',
-                          (payment['email'], 'premium', datetime.now(timezone.utc).isoformat()))
+                expires=(datetime.now(timezone.utc)+timedelta(days=30)).isoformat()
+                c.execute('INSERT INTO entitlements(email,plan,updated_at,expires_at) VALUES(?,?,?,?) ON CONFLICT(email) DO UPDATE SET plan=excluded.plan,updated_at=excluded.updated_at,expires_at=excluded.expires_at',
+                          (payment['email'], 'premium', datetime.now(timezone.utc).isoformat(), expires))
     return 'success', 200
 
 
@@ -612,10 +647,11 @@ def paystack_webhook():
         ref=data.get('reference','')
         try:
             with db() as c: p=c.execute('SELECT * FROM payments WHERE reference=?',(ref,)).fetchone()
-            if p and data.get('amount')==PRICE_KOBO and data.get('currency')=='NGN' and data.get('customer',{}).get('email','').lower()==p['email'].lower():
+            if p and p['status'] != 'success' and data.get('reference')==ref and data.get('amount')==p['amount'] and data.get('amount')==PLAN_PRICES_KOBO.get(p['plan']) and data.get('currency')=='NGN' and data.get('customer',{}).get('email','').lower()==p['email'].lower():
                 with db() as c:
                     c.execute('UPDATE payments SET status="success" WHERE reference=?',(ref,))
-                    c.execute('INSERT INTO entitlements(email,plan,updated_at) VALUES(?,?,?) ON CONFLICT(email) DO UPDATE SET plan=excluded.plan,updated_at=excluded.updated_at',(p['email'],'premium',datetime.now(timezone.utc).isoformat()))
+                    expires=(datetime.now(timezone.utc)+timedelta(days=30)).isoformat()
+                    c.execute('INSERT INTO entitlements(email,plan,updated_at,expires_at) VALUES(?,?,?,?) ON CONFLICT(email) DO UPDATE SET plan=excluded.plan,updated_at=excluded.updated_at,expires_at=excluded.expires_at',(p['email'],p['plan'],datetime.now(timezone.utc).isoformat(),expires))
         except Exception: return '',500
     return '',200
 

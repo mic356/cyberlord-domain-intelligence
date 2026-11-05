@@ -18,6 +18,10 @@ services:
         value: "1"
       - key: PAYSTACK_SECRET_KEY
         sync: false
+      - key: PREMIUM_PRICE_NGN
+        value: "5000"
+      - key: PROFESSIONAL_PRICE_NGN
+        value: "10000"
       - key: TON_WALLET_ADDRESS
         sync: false
       - key: BYBIT_PAY_API_KEY
