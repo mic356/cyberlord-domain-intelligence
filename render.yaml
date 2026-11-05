@@ -20,3 +20,17 @@ services:
         sync: false
       - key: TON_WALLET_ADDRESS
         sync: false
+      - key: BYBIT_PAY_API_KEY
+        sync: false
+      - key: BYBIT_PAY_API_SECRET
+        sync: false
+      - key: BYBIT_MERCHANT_ID
+        sync: false
+      - key: BYBIT_PREMIUM_PRICE_USDT
+        sync: false
+      - key: BYBIT_PAY_PLATFORM_PUBLIC_KEY
+        sync: false
+      - key: BYBIT_PAY_BASE_URL
+        value: https://api2.bybit.com
+      - key: BYBIT_MERCHANT_NAME
+        value: CyberLord Domain Intelligence

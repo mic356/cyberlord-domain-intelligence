@@ -1,5 +1,5 @@
-import os, re, json, time, hmac, hashlib, sqlite3, secrets, ipaddress, socket
-from datetime import datetime, timezone
+import os, re, json, time, hmac, hashlib, sqlite3, secrets, ipaddress, socket, base64
+from datetime import datetime, timezone, timedelta
 from functools import wraps
 from urllib.parse import urlparse
 import requests
@@ -15,7 +15,14 @@ PAYSTACK_WEBHOOK_SECRET = os.getenv('PAYSTACK_WEBHOOK_SECRET', '')
 TON_WALLET_ADDRESS = os.getenv('TON_WALLET_ADDRESS', '')
 app = Flask(__name__)
 app.secret_key = os.getenv('FLASK_SECRET_KEY', 'change-this-before-deployment-' + secrets.token_hex(16))
-app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax', SESSION_COOKIE_SECURE=os.getenv('COOKIE_SECURE', '0') == '1', MAX_CONTENT_LENGTH=1_000_000)
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    SESSION_COOKIE_SECURE=os.getenv('COOKIE_SECURE', '0') == '1',
+    PERMANENT_SESSION_LIFETIME=timedelta(days=7),
+    SESSION_REFRESH_EACH_REQUEST=True,
+    MAX_CONTENT_LENGTH=1_000_000
+)
 
 
 def db():
@@ -30,6 +37,7 @@ def init_db():
         c.execute('CREATE TABLE IF NOT EXISTS payments (reference TEXT PRIMARY KEY, email TEXT NOT NULL, amount INTEGER NOT NULL, currency TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL)')
         c.execute('CREATE TABLE IF NOT EXISTS entitlements (email TEXT PRIMARY KEY, plan TEXT NOT NULL, updated_at TEXT NOT NULL)')
         c.execute('CREATE TABLE IF NOT EXISTS scan_history (id INTEGER PRIMARY KEY, email TEXT NOT NULL, target TEXT NOT NULL, score INTEGER, created_at TEXT NOT NULL, report_json TEXT NOT NULL)')
+        c.execute('CREATE TABLE IF NOT EXISTS bybit_payments (merchant_trade_no TEXT PRIMARY KEY, email TEXT NOT NULL, amount TEXT NOT NULL, currency TEXT NOT NULL, status TEXT NOT NULL, pay_id TEXT, created_at TEXT NOT NULL)')
 
 init_db()
 
@@ -122,7 +130,7 @@ def tls_info(domain):
 def fetch_site(domain):
     headers = {'User-Agent': 'CyberLordDomainIntelligence/1.0 (passive security assessment)'}
     try:
-        r = requests.get('https://' + domain, timeout=8, allow_redirects=True, headers=headers, stream=True)
+        r = requests.get('https://' + domain, timeout=8, allow_redirects=False, headers=headers, stream=True)
         data = {'status': r.status_code, 'final_url': r.url, 'headers': dict(r.headers), 'cookies': [c.name for c in r.cookies], 'server': r.headers.get('Server'), 'powered_by': r.headers.get('X-Powered-By')}
         r.close()
         return data
@@ -183,6 +191,7 @@ def register():
     try:
         with db() as c: c.execute('INSERT INTO users(email,password_hash,created_at) VALUES(?,?,?)',(email,generate_password_hash(password),datetime.now(timezone.utc).isoformat()))
     except sqlite3.IntegrityError: return jsonify({'error':'An account with that email already exists.'}),409
+    session.permanent = True
     session['email']=email
     return jsonify({'ok':True,'email':email})
 
@@ -191,6 +200,7 @@ def login():
     data=request.get_json(silent=True) or {}; email=(data.get('email') or '').strip().lower(); password=data.get('password') or ''
     with db() as c: user=c.execute('SELECT * FROM users WHERE email=?',(email,)).fetchone()
     if not user or not check_password_hash(user['password_hash'],password): return jsonify({'error':'Email or password is incorrect.'}),401
+    session.permanent = True
     session['email']=email
     return jsonify({'ok':True,'email':email,'premium':premium(email)})
 
@@ -267,6 +277,70 @@ def cve_search():
         return jsonify({'query':q,'results':items,'source':'NIST National Vulnerability Database'})
     except Exception: return jsonify({'error':'NVD is temporarily unavailable. Try again later.'}),502
 
+
+@app.post('/api/dns-intel')
+@login_required
+@premium_required
+def dns_intel():
+    try:
+        domain = normalize_domain((request.get_json(silent=True) or {}).get('domain'))
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    records = {}
+    for kind in ['A', 'AAAA', 'MX', 'NS', 'TXT', 'CAA', 'SOA']:
+        try:
+            records[kind] = [str(x).strip('"') for x in dns.resolver.resolve(domain, kind, lifetime=4)][:30]
+        except Exception:
+            records[kind] = []
+    return jsonify({'domain': domain, 'records': records, 'source': 'Public DNS resolver'})
+
+
+@app.post('/api/technology')
+@login_required
+@premium_required
+def technology_fingerprint():
+    try:
+        domain = normalize_domain((request.get_json(silent=True) or {}).get('domain'))
+        resolve_public(domain)
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    result = fetch_site(domain)
+    headers = {str(k).lower(): str(v) for k, v in result.get('headers', {}).items()}
+    detected = []
+    server = headers.get('server')
+    powered = headers.get('x-powered-by')
+    if server: detected.append({'category': 'Web server', 'value': server})
+    if powered: detected.append({'category': 'Application platform', 'value': powered})
+    for key, label in [('x-aspnet-version', 'ASP.NET'), ('x-generator', 'Generator'), ('cf-ray', 'Cloudflare edge'), ('x-vercel-id', 'Vercel'), ('x-amz-cf-id', 'Amazon CloudFront')]:
+        if headers.get(key): detected.append({'category': label, 'value': headers[key]})
+    detected.append({'category': 'HTTPS', 'value': 'Available' if result.get('status') else 'Not confirmed'})
+    return jsonify({'domain': domain, 'technologies': detected, 'http_status': result.get('status'), 'note': 'Passive fingerprinting only. Some technologies intentionally hide identifying headers.'})
+
+
+@app.post('/api/port-scan')
+@login_required
+@premium_required
+def limited_port_scan():
+    data = request.get_json(silent=True) or {}
+    try:
+        domain = normalize_domain(data.get('domain'))
+        ips = resolve_public(domain)
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    # Restrained connect checks against common TCP service ports only.
+    ports = [22, 25, 53, 80, 110, 143, 443, 445, 587, 993, 995, 3306, 3389, 5432, 8080, 8443]
+    ip = ips[0]
+    found = []
+    for port in ports:
+        try:
+            with socket.create_connection((ip, port), timeout=0.45):
+                found.append({'port': port, 'state': 'open'})
+        except (OSError, TimeoutError):
+            pass
+    return jsonify({'domain': domain, 'ip_checked': ip, 'ports_checked': len(ports), 'open_ports': found,
+                    'note': 'Limited TCP connect checks only. Run only against systems you own or are explicitly authorised to assess.'})
+
+
 @app.post('/api/compare')
 @login_required
 @premium_required
@@ -318,6 +392,131 @@ def verify_reference(reference):
             c.execute('UPDATE payments SET status="success" WHERE reference=?',(reference,))
             c.execute('INSERT INTO entitlements(email,plan,updated_at) VALUES(?,?,?) ON CONFLICT(email) DO UPDATE SET plan=excluded.plan,updated_at=excluded.updated_at',(payment['email'],'premium',datetime.now(timezone.utc).isoformat()))
     return valid
+
+
+def bybit_pay_configured():
+    return all(os.getenv(k) for k in ['BYBIT_PAY_API_KEY', 'BYBIT_PAY_API_SECRET', 'BYBIT_MERCHANT_ID',
+                                      'BYBIT_PREMIUM_PRICE_USDT', 'BYBIT_PAY_PLATFORM_PUBLIC_KEY'])
+
+
+@app.post('/api/bybit/initialize')
+@login_required
+def bybit_initialize():
+    required = ['BYBIT_PAY_API_KEY', 'BYBIT_PAY_API_SECRET', 'BYBIT_MERCHANT_ID', 'BYBIT_PREMIUM_PRICE_USDT', 'BYBIT_PAY_PLATFORM_PUBLIC_KEY']
+    missing = [k for k in required if not os.getenv(k)]
+    if missing:
+        return jsonify({'error': 'Bybit Pay merchant integration is not configured. It requires an approved Bybit Pay merchant account and the server environment variables: ' + ', '.join(missing)}), 503
+    try:
+        amount = f"{float(os.environ['BYBIT_PREMIUM_PRICE_USDT']):.2f}"
+        if float(amount) <= 0:
+            raise ValueError()
+    except ValueError:
+        return jsonify({'error': 'BYBIT_PREMIUM_PRICE_USDT must be a positive amount.'}), 503
+
+    email = current_email()
+    trade_no = 'CLDI_' + secrets.token_hex(12)
+    now_ms = str(int(time.time() * 1000))
+    recv_window = '5000'
+    base_url = os.getenv('BYBIT_PAY_BASE_URL', 'https://api2.bybit.com').rstrip('/')
+    origin = request.url_root.rstrip('/')
+    payload = {
+        'merchantId': os.environ['BYBIT_MERCHANT_ID'],
+        'merchantName': os.getenv('BYBIT_MERCHANT_NAME', 'CyberLord Domain Intelligence'),
+        'paymentType': 'E_COMMERCE',
+        'merchantTradeNo': trade_no,
+        'orderAmount': amount,
+        'currency': 'USDT',
+        'currencyType': 'crypto',
+        'successUrl': origin + '/payment/bybit/return',
+        'failedUrl': origin + '/payment/bybit/return?status=failed',
+        'webhookUrl': origin + '/api/bybit/webhook',
+        'orderExpireTime': int(time.time()) + 3600,
+        'goods': [{
+            'shoppingName': 'CyberLord Domain Intelligence',
+            'mccCode': '5816',
+            'goodsName': 'CyberLord Premium Access',
+            'goodsDetail': 'Premium access to defensive domain intelligence tools'
+        }],
+        'customer': {'externalUserId': email},
+        'env': {
+            'terminalType': 'WEB',
+            'device': (request.headers.get('User-Agent', 'Web browser')[:180]),
+            'browserVersion': (request.headers.get('User-Agent', 'Unknown')[:180]),
+            'ip': request.remote_addr or '0.0.0.0'
+        }
+    }
+    body = json.dumps(payload, separators=(',', ':'), ensure_ascii=False)
+    api_key = os.environ['BYBIT_PAY_API_KEY']
+    secret = os.environ['BYBIT_PAY_API_SECRET']
+    sign_payload = now_ms + api_key + recv_window + body
+    signature = hmac.new(secret.encode(), sign_payload.encode(), hashlib.sha256).hexdigest()
+    headers = {
+        'X-BAPI-API-KEY': api_key,
+        'X-BAPI-TIMESTAMP': now_ms,
+        'X-BAPI-RECV-WINDOW': recv_window,
+        'X-BAPI-SIGN': signature,
+        'Content-Type': 'application/json'
+    }
+    try:
+        response = requests.post(base_url + '/v5/bybitpay/create_pay', data=body.encode('utf-8'), headers=headers, timeout=20)
+        response.raise_for_status()
+        data = response.json()
+        if data.get('retCode') != 100000:
+            return jsonify({'error': 'Bybit Pay rejected the checkout request: ' + str(data.get('retMsg', 'Unknown error'))[:180]}), 502
+        result = data.get('result') or {}
+        checkout = result.get('checkoutLink') or result.get('payUrl')
+        if not checkout:
+            return jsonify({'error': 'Bybit did not return a checkout link. Check your merchant configuration.'}), 502
+        with db() as c:
+            c.execute('INSERT INTO bybit_payments(merchant_trade_no,email,amount,currency,status,pay_id,created_at) VALUES(?,?,?,?,?,?,?)',
+                      (trade_no, email, amount, 'USDT', 'pending', result.get('payId'), datetime.now(timezone.utc).isoformat()))
+        return jsonify({'checkout_url': checkout, 'qr_content': result.get('qrContent'), 'merchant_trade_no': trade_no, 'amount': amount, 'currency': 'USDT'})
+    except requests.RequestException:
+        return jsonify({'error': 'Could not connect to Bybit Pay. Try again later.'}), 502
+    except Exception:
+        return jsonify({'error': 'Bybit Pay checkout could not be created. Check server configuration.'}), 502
+
+
+@app.post('/api/bybit/webhook')
+def bybit_webhook():
+    public_pem = os.getenv('BYBIT_PAY_PLATFORM_PUBLIC_KEY', '')
+    timestamp = request.headers.get('timestamp', '')
+    signature = request.headers.get('signature', '')
+    raw = request.get_data(cache=False)
+    if not public_pem or not timestamp or not signature:
+        return 'Webhook verification is not configured', 503
+    try:
+        ts = int(timestamp)
+        if abs(int(time.time()) - ts) > 300:
+            return 'Stale webhook', 401
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding
+        public_key = serialization.load_pem_public_key(public_pem.replace(r'\\n', '\n').encode())
+        public_key.verify(base64.b64decode(signature), timestamp.encode() + raw, padding.PKCS1v15(), hashes.SHA256())
+        event = json.loads(raw.decode('utf-8'))
+    except Exception:
+        return 'Invalid webhook signature', 401
+
+    if event.get('merchantId') != os.getenv('BYBIT_MERCHANT_ID'):
+        return 'Merchant mismatch', 400
+    trade_no = event.get('merchantTradeNo', '')
+    if event.get('status') == 'PAY_SUCCESS' and event.get('paymentType') == 'E_COMMERCE':
+        with db() as c:
+            payment = c.execute('SELECT * FROM bybit_payments WHERE merchant_trade_no=?', (trade_no,)).fetchone()
+        if payment and event.get('currency') == 'USDT' and str(event.get('amount')) == payment['amount']:
+            with db() as c:
+                c.execute('UPDATE bybit_payments SET status="success", pay_id=COALESCE(?,pay_id) WHERE merchant_trade_no=?',
+                          (event.get('payId'), trade_no))
+                c.execute('INSERT INTO entitlements(email,plan,updated_at) VALUES(?,?,?) ON CONFLICT(email) DO UPDATE SET plan=excluded.plan,updated_at=excluded.updated_at',
+                          (payment['email'], 'premium', datetime.now(timezone.utc).isoformat()))
+    return 'success', 200
+
+
+@app.get('/payment/bybit/return')
+def bybit_payment_return():
+    return render_template('payment_result.html', success=False, provider='Bybit Pay',
+                           message='Your payment is being confirmed. Premium access activates automatically after Bybit verifies the payment and sends its signed notification.')
+
 
 @app.get('/payment/return')
 def payment_return():
