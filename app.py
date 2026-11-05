@@ -413,6 +413,41 @@ def individual_email_intel():
                     'note': 'This checks public mail-domain configuration only. It does not confirm mailbox existence, ownership, inbox access, or breach status.'})
 
 
+@app.post('/api/breach-check')
+@login_required
+@premium_required
+def breach_check():
+    """Return breach-notification metadata only; never fetch passwords or private content."""
+    address = (request.get_json(silent=True) or {}).get('email', '').strip().lower()
+    if len(address) > 254 or not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+', address):
+        return jsonify({'error': 'Enter one valid email address.'}), 400
+    api_key = os.getenv('HIBP_API_KEY', '')
+    if not api_key:
+        return jsonify({'error': 'Breach checking is not configured. Add HIBP_API_KEY in the hosting environment.'}), 503
+    try:
+        response = requests.get(
+            'https://haveibeenpwned.com/api/v3/breachedaccount/' + requests.utils.quote(address, safe=''),
+            headers={'hibp-api-key': api_key, 'user-agent': 'CyberLord-Domain-Intelligence'},
+            params={'truncateResponse': 'true'}, timeout=15)
+        if response.status_code == 404:
+            return jsonify({'email': address, 'found': False, 'breaches': [], 'breach_count': 0,
+                'source': 'Have I Been Pwned', 'checked_at': datetime.now(timezone.utc).isoformat(),
+                'note': 'No matching breach was returned by this source. This is not proof the account was never exposed.'})
+        if response.status_code == 401:
+            return jsonify({'error': 'The breach intelligence API key was rejected.'}), 502
+        response.raise_for_status()
+        rows = response.json() if response.content else []
+        breaches = [{'name': x.get('Name'), 'title': x.get('Title'), 'domain': x.get('Domain'),
+            'breach_date': x.get('BreachDate'), 'added_date': x.get('AddedDate'),
+            'data_classes': x.get('DataClasses', []), 'verified': x.get('IsVerified', False)} for x in rows]
+        return jsonify({'email': address, 'found': bool(breaches), 'breach_count': len(breaches),
+            'breaches': breaches, 'source': 'Have I Been Pwned',
+            'checked_at': datetime.now(timezone.utc).isoformat(),
+            'note': 'Breach metadata only. Passwords, private messages, and raw leaked records are never retrieved or displayed.'})
+    except requests.RequestException:
+        return jsonify({'error': 'The breach intelligence provider is temporarily unavailable.'}), 502
+
+
 @app.post('/api/phone-intel')
 @login_required
 @premium_required
