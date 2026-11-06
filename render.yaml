@@ -2,21 +2,23 @@ services:
   - type: web
     name: cyberlord-domain-intelligence
     runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app
     plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 2 --threads 4 --timeout 120
     disk:
       name: cyberlord-data
       mountPath: /var/data
       sizeGB: 1
     envVars:
-      - key: PAYMENTS_DB
-        value: /var/data/cyberlord.db
       - key: FLASK_SECRET_KEY
         generateValue: true
+      - key: PAYMENTS_DB
+        value: /var/data/cyberlord.db
       - key: COOKIE_SECURE
         value: "1"
       - key: PAYSTACK_SECRET_KEY
+        sync: false
+      - key: PAYSTACK_WEBHOOK_SECRET
         sync: false
       - key: TON_WALLET_ADDRESS
         sync: false
