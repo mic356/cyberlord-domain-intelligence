@@ -6,23 +6,26 @@ import requests
 import dns.resolver
 from flask import Flask, request, jsonify, render_template, session, redirect, url_for
 from werkzeug.security import generate_password_hash, check_password_hash
+from flask import abort
 
 APP_NAME = 'CyberLord Domain Intelligence'
 DB_PATH = os.getenv('PAYMENTS_DB', 'cyberlord.db')
-PRICE_KOBO = 500000  # legacy Premium price; plan-specific prices are resolved server-side
-PLAN_PRICES_KOBO = {'premium': int(os.getenv('PREMIUM_PRICE_NGN', '5000')) * 100, 'professional': int(os.getenv('PROFESSIONAL_PRICE_NGN', '10000')) * 100}
+PRICE_KOBO = 500000
 PAYSTACK_SECRET_KEY = os.getenv('PAYSTACK_SECRET_KEY', '')
 PAYSTACK_WEBHOOK_SECRET = os.getenv('PAYSTACK_WEBHOOK_SECRET', '')
 TON_WALLET_ADDRESS = os.getenv('TON_WALLET_ADDRESS', '')
 app = Flask(__name__)
-app.secret_key = os.getenv('FLASK_SECRET_KEY', 'change-this-before-deployment-' + secrets.token_hex(16))
+app.secret_key = os.getenv('FLASK_SECRET_KEY') or ('development-only-' + secrets.token_hex(32))
+if os.getenv('RENDER') and not os.getenv('FLASK_SECRET_KEY'):
+    raise RuntimeError('FLASK_SECRET_KEY must be configured in production.')
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE='Lax',
     SESSION_COOKIE_SECURE=os.getenv('COOKIE_SECURE', '0') == '1',
     PERMANENT_SESSION_LIFETIME=timedelta(days=7),
     SESSION_REFRESH_EACH_REQUEST=True,
-    MAX_CONTENT_LENGTH=1_000_000
+    MAX_CONTENT_LENGTH=1_000_000,
+    SESSION_COOKIE_NAME='cyberlord_session'
 )
 
 
@@ -35,18 +38,8 @@ def db():
 def init_db():
     with db() as c:
         c.execute('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, created_at TEXT NOT NULL)')
-        c.execute("CREATE TABLE IF NOT EXISTS payments (reference TEXT PRIMARY KEY, email TEXT NOT NULL, amount INTEGER NOT NULL, currency TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, plan TEXT NOT NULL DEFAULT 'premium')")
-        c.execute('CREATE TABLE IF NOT EXISTS entitlements (email TEXT PRIMARY KEY, plan TEXT NOT NULL, updated_at TEXT NOT NULL, expires_at TEXT)')
-        # Safe additive migrations for existing installations.
-        payment_cols = {r['name'] for r in c.execute('PRAGMA table_info(payments)').fetchall()}
-        if 'plan' not in payment_cols: c.execute("ALTER TABLE payments ADD COLUMN plan TEXT NOT NULL DEFAULT 'premium'")
-        entitlement_cols = {r['name'] for r in c.execute('PRAGMA table_info(entitlements)').fetchall()}
-        if 'expires_at' not in entitlement_cols: c.execute('ALTER TABLE entitlements ADD COLUMN expires_at TEXT')
-        # Convert legacy non-expiring paid rows to a 30-day entitlement from their original grant date.
-        for old in c.execute('SELECT email, updated_at FROM entitlements WHERE expires_at IS NULL').fetchall():
-            try: exp = (datetime.fromisoformat(old['updated_at']) + timedelta(days=30)).isoformat()
-            except Exception: exp = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
-            c.execute('UPDATE entitlements SET expires_at=? WHERE email=?', (exp, old['email']))
+        c.execute('CREATE TABLE IF NOT EXISTS payments (reference TEXT PRIMARY KEY, email TEXT NOT NULL, amount INTEGER NOT NULL, currency TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL)')
+        c.execute('CREATE TABLE IF NOT EXISTS entitlements (email TEXT PRIMARY KEY, plan TEXT NOT NULL, updated_at TEXT NOT NULL)')
         c.execute('CREATE TABLE IF NOT EXISTS scan_history (id INTEGER PRIMARY KEY, email TEXT NOT NULL, target TEXT NOT NULL, score INTEGER, created_at TEXT NOT NULL, report_json TEXT NOT NULL)')
         c.execute('CREATE TABLE IF NOT EXISTS bybit_payments (merchant_trade_no TEXT PRIMARY KEY, email TEXT NOT NULL, amount TEXT NOT NULL, currency TEXT NOT NULL, status TEXT NOT NULL, pay_id TEXT, created_at TEXT NOT NULL)')
 
@@ -57,29 +50,12 @@ def current_email():
     return session.get('email')
 
 
-def entitlement(email=None):
+def premium(email=None):
     email = email or current_email()
     if not email:
-        return {'plan': 'free', 'active': False, 'expires_at': None}
+        return False
     with db() as c:
-        row = c.execute('SELECT plan, expires_at FROM entitlements WHERE email=?', (email,)).fetchone()
-    if not row:
-        return {'plan': 'free', 'active': False, 'expires_at': None}
-    expires = row['expires_at']
-    active = True
-    if expires:
-        try: active = datetime.fromisoformat(expires) > datetime.now(timezone.utc)
-        except ValueError: active = False
-    plan = row['plan'] if active else 'free'
-    return {'plan': plan, 'active': plan in ('premium', 'professional'), 'expires_at': expires if active else None}
-
-
-def premium(email=None):
-    return entitlement(email)['active']
-
-
-def professional(email=None):
-    return entitlement(email)['plan'] == 'professional'
+        return c.execute('SELECT 1 FROM entitlements WHERE email=? AND plan="premium"', (email,)).fetchone() is not None
 
 
 def login_required(fn):
@@ -96,15 +72,6 @@ def premium_required(fn):
     def wrapped(*a, **kw):
         if not premium():
             return jsonify({'error': 'Premium feature. Upgrade to unlock this tool.'}), 402
-        return fn(*a, **kw)
-    return wrapped
-
-
-def professional_required(fn):
-    @wraps(fn)
-    def wrapped(*a, **kw):
-        if not professional():
-            return jsonify({'error': 'Professional feature. Upgrade to the Professional plan to unlock this tool.'}), 402
         return fn(*a, **kw)
     return wrapped
 
@@ -218,16 +185,25 @@ def ct_subdomains(domain, limit=100):
 
 @app.get('/')
 def index():
+    if not current_email():
+        return redirect(url_for('login_page'))
     return render_template('index.html', email=current_email(), is_premium=premium(), ton_wallet=TON_WALLET_ADDRESS)
+
+@app.get('/login')
+def login_page():
+    if current_email():
+        return redirect(url_for('index'))
+    return render_template('login.html')
 
 @app.post('/api/register')
 def register():
     data=request.get_json(silent=True) or {}; email=(data.get('email') or '').strip().lower(); password=data.get('password') or ''
-    if not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+', email) or len(password)<10:
-        return jsonify({'error':'Enter a valid email and a password of at least 10 characters.'}),400
+    if not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+', email) or len(password)<12 or len(password)>128:
+        return jsonify({'error':'Enter a valid email and a password between 12 and 128 characters.'}),400
     try:
         with db() as c: c.execute('INSERT INTO users(email,password_hash,created_at) VALUES(?,?,?)',(email,generate_password_hash(password),datetime.now(timezone.utc).isoformat()))
     except sqlite3.IntegrityError: return jsonify({'error':'An account with that email already exists.'}),409
+    session.clear()
     session.permanent = True
     session['email']=email
     return jsonify({'ok':True,'email':email})
@@ -237,16 +213,17 @@ def login():
     data=request.get_json(silent=True) or {}; email=(data.get('email') or '').strip().lower(); password=data.get('password') or ''
     with db() as c: user=c.execute('SELECT * FROM users WHERE email=?',(email,)).fetchone()
     if not user or not check_password_hash(user['password_hash'],password): return jsonify({'error':'Email or password is incorrect.'}),401
+    session.clear()
     session.permanent = True
     session['email']=email
     return jsonify({'ok':True,'email':email,'premium':premium(email)})
 
 @app.post('/api/logout')
 def logout():
-    session.clear(); return jsonify({'ok':True})
+    session.clear(); return jsonify({'ok':True,'redirect':'/login'})
 
 @app.get('/api/me')
-def me(): e=entitlement(); return jsonify({'email':current_email(),'premium':e['active'],'plan':e['plan'],'expires_at':e['expires_at'],'professional':e['plan']=='professional','ton_wallet':TON_WALLET_ADDRESS})
+def me(): return jsonify({'email':current_email(),'premium':premium(),'ton_wallet':TON_WALLET_ADDRESS})
 
 @app.post('/api/scan')
 @login_required
@@ -254,7 +231,8 @@ def scan():
     data=request.get_json(silent=True) or {}
     try: domain=normalize_domain(data.get('domain'))
     except ValueError as e: return jsonify({'error':str(e)}),400
-    report=run_scan(domain)
+    try: report=run_scan(domain)
+    except Exception as e: return jsonify({'error':'Scan could not complete. Check that the domain is public and reachable.'}),502
     if not premium():
         report['dns']={k:v for k,v in report['dns'].items() if k in ['A','AAAA','MX','NS']}
         report['findings']=report['findings'][:3]
@@ -273,13 +251,21 @@ def subdomains():
 @login_required
 @premium_required
 def email_security():
-    try: domain=normalize_domain((request.get_json(silent=True) or {}).get('domain'))
-    except ValueError as e: return jsonify({'error':str(e)}),400
+    raw=(request.get_json(silent=True) or {}).get('email') or (request.get_json(silent=True) or {}).get('domain') or ''
+    if '@' in raw:
+        if not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+', raw.strip()): return jsonify({'error':'Enter a valid email address.'}),400
+        address=raw.strip().lower(); domain=address.rsplit('@',1)[1]
+    else:
+        address=None
+        try: domain=normalize_domain(raw)
+        except ValueError as e: return jsonify({'error':str(e)}),400
     result={}
     for label, name in [('SPF',domain),('DMARC','_dmarc.'+domain),('DKIM selector default','default._domainkey.'+domain)]:
         try: result[label]=[str(x).strip('"') for x in dns.resolver.resolve(name,'TXT',lifetime=4)]
         except Exception: result[label]=[]
-    return jsonify({'domain':domain,'records':result,'note':'DKIM commonly uses provider-specific selectors; an empty default selector does not prove DKIM is absent.'})
+    try: mx=[str(x.exchange).rstrip('.') for x in dns.resolver.resolve(domain,'MX',lifetime=4)]
+    except Exception: mx=[]
+    return jsonify({'email':address,'domain':domain,'mx':mx,'records':result,'note':'Only public DNS authentication records are checked. DKIM uses provider-specific selectors; an empty default selector does not prove DKIM is absent. No mailbox is contacted and no breach/private account data is retrieved.'})
 
 @app.post('/api/ip-intel')
 @login_required
@@ -294,6 +280,22 @@ def ip_intel():
         if not data.get('success',True): return jsonify({'error':'IP intelligence provider returned no result.'}),502
         return jsonify({k:data.get(k) for k in ['ip','type','continent','country','region','city','latitude','longitude','connection','timezone']})
     except Exception: return jsonify({'error':'IP intelligence provider is temporarily unavailable.'}),502
+
+@app.post('/api/phone-intel')
+@login_required
+@premium_required
+def phone_intel():
+    raw=(request.get_json(silent=True) or {}).get('phone','').strip()
+    try:
+        import phonenumbers
+        from phonenumbers import geocoder, carrier, number_type
+        num=phonenumbers.parse(raw, None if raw.startswith('+') else 'NG')
+        valid=phonenumbers.is_valid_number(num)
+        if not valid: return jsonify({'error':'This number is not a valid international phone number.'}),400
+        return jsonify({'input':raw,'international':phonenumbers.format_number(num,phonenumbers.PhoneNumberFormat.INTERNATIONAL),'country_code':num.country_code,'region':phonenumbers.region_code_for_number(num),'number_type':str(number_type(num)),'carrier_hint':carrier.name_for_number(num,'en') or 'Not available','numbering_region':geocoder.description_for_number(num,'en') or 'Not available','privacy_note':'This checks numbering metadata only. It does not locate a person, identify a subscriber, access call records, or establish that a number is fraudulent.'})
+    except ImportError: return jsonify({'error':'Phone metadata dependency is not installed.'}),503
+    except Exception: return jsonify({'error':'Enter a valid international number, preferably in +country-code format.'}),400
+
 
 @app.post('/api/cve')
 @login_required
@@ -359,6 +361,8 @@ def technology_fingerprint():
 @premium_required
 def limited_port_scan():
     data = request.get_json(silent=True) or {}
+    if data.get('authorised') is not True:
+        return jsonify({'error':'Confirm that you own or have explicit written permission to test this system.'}),403
     try:
         domain = normalize_domain(data.get('domain'))
         ips = resolve_public(domain)
@@ -389,108 +393,6 @@ def compare():
     ra=run_scan(a); rb=run_scan(b)
     return jsonify({'domain_a':{'domain':a,'score':ra['score'],'ips':ra['ips'],'tls':ra['tls'],'findings':ra['findings']},'domain_b':{'domain':b,'score':rb['score'],'ips':rb['ips'],'tls':rb['tls'],'findings':rb['findings']}})
 
-@app.post('/api/email-intel')
-@login_required
-@premium_required
-def individual_email_intel():
-    raw = (request.get_json(silent=True) or {}).get('email', '').strip().lower()
-    if len(raw) > 254 or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", raw):
-        return jsonify({'error': 'Enter one valid individual email address.'}), 400
-    local, domain = raw.rsplit('@', 1)
-    try: domain = normalize_domain(domain)
-    except ValueError as e: return jsonify({'error': 'The email domain is not valid: ' + str(e)}), 400
-    records = {}
-    for kind in ['MX', 'TXT']:
-        try: records[kind] = [str(x).strip('"') for x in dns.resolver.resolve(domain, kind, lifetime=4)][:30]
-        except Exception: records[kind] = []
-    try:
-        dmarc = [str(x).strip('"') for x in dns.resolver.resolve('_dmarc.' + domain, 'TXT', lifetime=4)]
-    except Exception: dmarc = []
-    txt = records.get('TXT', [])
-    return jsonify({'email': raw, 'local_part_present': bool(local), 'domain': domain,
-                    'mx_records': records['MX'], 'spf_records': [x for x in txt if x.lower().startswith('v=spf1')],
-                    'dmarc_records': dmarc, 'has_mx': bool(records['MX']),
-                    'note': 'This checks public mail-domain configuration only. It does not confirm mailbox existence, ownership, inbox access, or breach status.'})
-
-
-@app.post('/api/breach-check')
-@login_required
-@premium_required
-def breach_check():
-    """Return breach-notification metadata only; never fetch passwords or private content."""
-    address = (request.get_json(silent=True) or {}).get('email', '').strip().lower()
-    if len(address) > 254 or not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+', address):
-        return jsonify({'error': 'Enter one valid email address.'}), 400
-    api_key = os.getenv('HIBP_API_KEY', '')
-    if not api_key:
-        return jsonify({'error': 'Breach checking is not configured. Add HIBP_API_KEY in the hosting environment.'}), 503
-    try:
-        response = requests.get(
-            'https://haveibeenpwned.com/api/v3/breachedaccount/' + requests.utils.quote(address, safe=''),
-            headers={'hibp-api-key': api_key, 'user-agent': 'CyberLord-Domain-Intelligence'},
-            params={'truncateResponse': 'true'}, timeout=15)
-        if response.status_code == 404:
-            return jsonify({'email': address, 'found': False, 'breaches': [], 'breach_count': 0,
-                'source': 'Have I Been Pwned', 'checked_at': datetime.now(timezone.utc).isoformat(),
-                'note': 'No matching breach was returned by this source. This is not proof the account was never exposed.'})
-        if response.status_code == 401:
-            return jsonify({'error': 'The breach intelligence API key was rejected.'}), 502
-        response.raise_for_status()
-        rows = response.json() if response.content else []
-        breaches = [{'name': x.get('Name'), 'title': x.get('Title'), 'domain': x.get('Domain'),
-            'breach_date': x.get('BreachDate'), 'added_date': x.get('AddedDate'),
-            'data_classes': x.get('DataClasses', []), 'verified': x.get('IsVerified', False)} for x in rows]
-        return jsonify({'email': address, 'found': bool(breaches), 'breach_count': len(breaches),
-            'breaches': breaches, 'source': 'Have I Been Pwned',
-            'checked_at': datetime.now(timezone.utc).isoformat(),
-            'note': 'Breach metadata only. Passwords, private messages, and raw leaked records are never retrieved or displayed.'})
-    except requests.RequestException:
-        return jsonify({'error': 'The breach intelligence provider is temporarily unavailable.'}), 502
-
-
-@app.post('/api/phone-intel')
-@login_required
-@premium_required
-def phone_intel():
-    raw = (request.get_json(silent=True) or {}).get('phone', '').strip()
-    if not raw or len(raw) > 40:
-        return jsonify({'error': 'Enter a phone number including its country code, e.g. +2348012345678.'}), 400
-    try:
-        import phonenumbers
-        from phonenumbers import carrier, geocoder, number_type
-        number = phonenumbers.parse(raw, None)
-        if not phonenumbers.is_possible_number(number) or not phonenumbers.is_valid_number(number):
-            return jsonify({'error': 'The number does not appear to be a valid number in its numbering region.'}), 400
-        kinds = {0:'FIXED_LINE',1:'MOBILE',2:'FIXED_LINE_OR_MOBILE',3:'TOLL_FREE',4:'PREMIUM_RATE',5:'SHARED_COST',6:'VOIP',7:'PERSONAL_NUMBER',8:'PAGER',9:'UAN',10:'VOICEMAIL',99:'UNKNOWN'}
-        return jsonify({'input': raw, 'international_format': phonenumbers.format_number(number, phonenumbers.PhoneNumberFormat.INTERNATIONAL),
-                        'e164': phonenumbers.format_number(number, phonenumbers.PhoneNumberFormat.E164),
-                        'valid_numbering_plan': True, 'country_code': number.country_code,
-                        'region': phonenumbers.region_code_for_number(number),
-                        'location': geocoder.description_for_number(number, 'en'),
-                        'number_type': kinds.get(number_type(number), 'UNKNOWN'),
-                        'carrier': carrier.name_for_number(number, 'en') or 'Not available',
-                        'ownership_verified': False,
-                        'note': 'Numbering-plan and public metadata only. This does not prove that the user owns or controls the number. SMS OTP ownership verification requires a configured SMS provider.'})
-    except ImportError:
-        return jsonify({'error': 'Phone intelligence dependency is not installed. Deploy the updated requirements.txt.'}), 503
-    except Exception:
-        return jsonify({'error': 'Use international format with a +country code, for example +2348012345678.'}), 400
-
-
-@app.post('/api/attack-surface-map')
-@login_required
-@professional_required
-def attack_surface_map():
-    try: domain = normalize_domain((request.get_json(silent=True) or {}).get('domain'))
-    except ValueError as e: return jsonify({'error': str(e)}), 400
-    ips = resolve_public(domain)
-    subs = ct_subdomains(domain, 250)
-    records = dns_records(domain)
-    return jsonify({'domain': domain, 'public_ips': ips, 'subdomains': subs, 'dns': records,
-                    'tls': tls_info(domain), 'mapping_scope': 'Passive public DNS and certificate-transparency data only',
-                    'note': 'This map does not exploit hosts or probe third-party infrastructure. Assess only assets you own or are authorised to test.'})
-
-
 @app.get('/api/history')
 @login_required
 def history():
@@ -510,14 +412,11 @@ def report(report_id):
 def payment_initialize():
     if not PAYSTACK_SECRET_KEY: return jsonify({'error':'Payments are not configured yet. Add PAYSTACK_SECRET_KEY in your hosting environment.'}),503
     email=current_email(); reference='CLDI_'+secrets.token_hex(12)
-    plan = (request.get_json(silent=True) or {}).get('plan', 'premium')
-    if plan not in PLAN_PRICES_KOBO: return jsonify({'error':'Choose a valid paid plan.'}),400
-    amount_kobo = PLAN_PRICES_KOBO[plan]
     try:
-        r=requests.post('https://api.paystack.co/transaction/initialize',headers={'Authorization':'Bearer '+PAYSTACK_SECRET_KEY,'Content-Type':'application/json'},json={'email':email,'amount':amount_kobo,'currency':'NGN','reference':reference,'callback_url':request.url_root.rstrip('/')+'/payment/return','channels':['card','bank','bank_transfer','ussd'],'metadata':{'product':APP_NAME,'plan':plan}},timeout=15)
+        r=requests.post('https://api.paystack.co/transaction/initialize',headers={'Authorization':'Bearer '+PAYSTACK_SECRET_KEY,'Content-Type':'application/json'},json={'email':email,'amount':PRICE_KOBO,'currency':'NGN','reference':reference,'callback_url':request.url_root.rstrip('/')+'/payment/return','channels':['card','bank','bank_transfer','ussd'],'metadata':{'product':APP_NAME,'plan':'premium'}},timeout=15)
         data=r.json()
         if not data.get('status'): return jsonify({'error':data.get('message','Could not initialize payment.')}),502
-        with db() as c: c.execute('INSERT INTO payments(reference,email,amount,currency,status,created_at,plan) VALUES(?,?,?,?,?,?,?)',(reference,email,amount_kobo,'NGN','pending',datetime.now(timezone.utc).isoformat(),plan))
+        with db() as c: c.execute('INSERT INTO payments(reference,email,amount,currency,status,created_at) VALUES(?,?,?,?,?,?)',(reference,email,PRICE_KOBO,'NGN','pending',datetime.now(timezone.utc).isoformat()))
         return jsonify({'authorization_url':data['data']['authorization_url'],'reference':reference})
     except Exception: return jsonify({'error':'Paystack could not be reached. Try again.'}),502
 
@@ -528,13 +427,11 @@ def verify_reference(reference):
     data=r.json().get('data',{})
     with db() as c: payment=c.execute('SELECT * FROM payments WHERE reference=?',(reference,)).fetchone()
     if not payment: return False
-    if payment['status'] == 'success': return True
-    valid=(data.get('status')=='success' and data.get('amount')==payment['amount'] and data.get('amount')==PLAN_PRICES_KOBO.get(payment['plan']) and data.get('currency')=='NGN' and data.get('reference')==reference and (data.get('customer',{}).get('email','').lower()==payment['email'].lower()))
+    valid=(data.get('status')=='success' and data.get('amount')==PRICE_KOBO and data.get('currency')=='NGN' and data.get('reference')==reference and (data.get('customer',{}).get('email','').lower()==payment['email'].lower()))
     if valid:
         with db() as c:
             c.execute('UPDATE payments SET status="success" WHERE reference=?',(reference,))
-            expires=(datetime.now(timezone.utc)+timedelta(days=30)).isoformat()
-            c.execute('INSERT INTO entitlements(email,plan,updated_at,expires_at) VALUES(?,?,?,?) ON CONFLICT(email) DO UPDATE SET plan=excluded.plan,updated_at=excluded.updated_at,expires_at=excluded.expires_at',(payment['email'],payment['plan'],datetime.now(timezone.utc).isoformat(),expires))
+            c.execute('INSERT INTO entitlements(email,plan,updated_at) VALUES(?,?,?) ON CONFLICT(email) DO UPDATE SET plan=excluded.plan,updated_at=excluded.updated_at',(payment['email'],'premium',datetime.now(timezone.utc).isoformat()))
     return valid
 
 
@@ -647,13 +544,12 @@ def bybit_webhook():
     if event.get('status') == 'PAY_SUCCESS' and event.get('paymentType') == 'E_COMMERCE':
         with db() as c:
             payment = c.execute('SELECT * FROM bybit_payments WHERE merchant_trade_no=?', (trade_no,)).fetchone()
-        if payment and payment['status'] != 'success' and event.get('currency') == 'USDT' and str(event.get('amount')) == payment['amount']:
+        if payment and event.get('currency') == 'USDT' and str(event.get('amount')) == payment['amount'] and (not payment['pay_id'] or not event.get('payId') or str(event.get('payId')) == str(payment['pay_id'])):
             with db() as c:
                 c.execute('UPDATE bybit_payments SET status="success", pay_id=COALESCE(?,pay_id) WHERE merchant_trade_no=?',
                           (event.get('payId'), trade_no))
-                expires=(datetime.now(timezone.utc)+timedelta(days=30)).isoformat()
-                c.execute('INSERT INTO entitlements(email,plan,updated_at,expires_at) VALUES(?,?,?,?) ON CONFLICT(email) DO UPDATE SET plan=excluded.plan,updated_at=excluded.updated_at,expires_at=excluded.expires_at',
-                          (payment['email'], 'premium', datetime.now(timezone.utc).isoformat(), expires))
+                c.execute('INSERT INTO entitlements(email,plan,updated_at) VALUES(?,?,?) ON CONFLICT(email) DO UPDATE SET plan=excluded.plan,updated_at=excluded.updated_at',
+                          (payment['email'], 'premium', datetime.now(timezone.utc).isoformat()))
     return 'success', 200
 
 
@@ -682,13 +578,21 @@ def paystack_webhook():
         ref=data.get('reference','')
         try:
             with db() as c: p=c.execute('SELECT * FROM payments WHERE reference=?',(ref,)).fetchone()
-            if p and p['status'] != 'success' and data.get('reference')==ref and data.get('amount')==p['amount'] and data.get('amount')==PLAN_PRICES_KOBO.get(p['plan']) and data.get('currency')=='NGN' and data.get('customer',{}).get('email','').lower()==p['email'].lower():
+            if p and data.get('amount')==PRICE_KOBO and data.get('currency')=='NGN' and data.get('customer',{}).get('email','').lower()==p['email'].lower():
                 with db() as c:
                     c.execute('UPDATE payments SET status="success" WHERE reference=?',(ref,))
-                    expires=(datetime.now(timezone.utc)+timedelta(days=30)).isoformat()
-                    c.execute('INSERT INTO entitlements(email,plan,updated_at,expires_at) VALUES(?,?,?,?) ON CONFLICT(email) DO UPDATE SET plan=excluded.plan,updated_at=excluded.updated_at,expires_at=excluded.expires_at',(p['email'],p['plan'],datetime.now(timezone.utc).isoformat(),expires))
+                    c.execute('INSERT INTO entitlements(email,plan,updated_at) VALUES(?,?,?) ON CONFLICT(email) DO UPDATE SET plan=excluded.plan,updated_at=excluded.updated_at',(p['email'],'premium',datetime.now(timezone.utc).isoformat()))
         except Exception: return '',500
     return '',200
+
+@app.after_request
+def security_headers(response):
+    response.headers.setdefault('X-Content-Type-Options','nosniff')
+    response.headers.setdefault('X-Frame-Options','DENY')
+    response.headers.setdefault('Referrer-Policy','strict-origin-when-cross-origin')
+    response.headers.setdefault('Permissions-Policy','camera=(), microphone=(), geolocation=()')
+    response.headers.setdefault('Content-Security-Policy', "default-src 'self' https://fonts.googleapis.com https://fonts.gstatic.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'")
+    return response
 
 @app.errorhandler(429)
 def too_many(e): return jsonify({'error':'Too many requests. Please wait and try again.'}),429
